@@ -11,7 +11,7 @@ import time
 # کتابخانه‌های اصلی
 from faster_whisper import WhisperModel
 import ffmpeg
-from openai import OpenAI
+import ollama
 
 # =============== بخش تبدیل گفتار به متن با Whisper ===============
 def transcribe_video(video_path, model_size="large-v3", device="cpu"):
@@ -37,23 +37,19 @@ def transcribe_video(video_path, model_size="large-v3", device="cpu"):
     return words_data
 
 # =============== ارتباط با LLM برای اصلاح و تولید EDL ===============
-def get_edl_from_llm(transcriptions, api_key, model_name="gpt-4-turbo"):
+def get_edl_from_llm(transcriptions, model_name="partai/dorna-llama3:8b-instruct-q5_0"):
     """
-    ارسال متن‌ها و تایم‌کدها به LLM و دریافت JSON تدوین
+    ارسال متن‌ها به مدل محلی Ollama و دریافت JSON تدوین
     """
-    client = OpenAI(api_key=api_key)
-    
-    # ساخت پرامپت فارسی
     prompt = f"""
     من چندین فایل مصاحبه به زبان فارسی دارم که متن و تایم‌کد آن‌ها را با Whisper استخراج کرده‌ام.
     لطفاً این کارها را انجام بده:
 
     ۱. خطاهای املایی و نگارشی متن‌های فارسی را اصلاح کن (مثلاً «میرم» را به «می‌روم» تبدیل کن).
-    ۲. همهٔ مصاحبه‌ها را از نظر محتوایی بررسی کن و یک «مضمون مشترک» بین آن‌ها پیدا کن (مثلاً اگر همه دربارهٔ «چالش‌های کاری» صحبت کرده‌اند).
+    ۲. همهٔ مصاحبه‌ها را از نظر محتوایی بررسی کن و یک «مضمون مشترک» بین آن‌ها پیدا کن.
     ۳. برای آن مضمون، گویاترین و تأثیرگذارترین جملات را از بین همهٔ مصاحبه‌ها انتخاب کن. اگر جمله‌ای تکراری بود، فقط بهترین نسخه‌اش را نگه دار.
-    ۴. در نهایت، یک خروجی JSON با فرمت زیر به من بده تا با FFmpeg تدوین کنم. دقت کن تایم‌کدها دقیقاً از همان متن‌هایی که می‌فرستم برداشت شود.
+    ۴. در نهایت، یک خروجی JSON با فرمت زیر به من بده:
 
-    فرمت خروجی JSON:
     {{
       "clips": [
         {{"source_file": "نام_فایل_اصلی.mp4", "start_time": ۱۰.۵, "end_time": ۲۵.۳}},
@@ -61,7 +57,7 @@ def get_edl_from_llm(transcriptions, api_key, model_name="gpt-4-turbo"):
       ]
     }}
 
-    توجه: source_file باید دقیقاً همان نام فایلی باشد که در ورودی داده‌ام. 
+    توجه: source_file باید دقیقاً همان نام فایلی باشد که در ورودی داده‌ام.
     حالا متن‌های خروجی Whisper به همراه نام فایل مربوطه:
 
     {json.dumps(transcriptions, ensure_ascii=False, indent=2)}
@@ -69,18 +65,26 @@ def get_edl_from_llm(transcriptions, api_key, model_name="gpt-4-turbo"):
     فقط JSON را برگردان و هیچ توضیح دیگری نده.
     """
     
-    response = client.chat.completions.create(
+    response = ollama.chat(
         model=model_name,
         messages=[
-            {"role": "system", "content": "تو یک ویراستار متخصص فارسی و تدوینگر حرفه‌ای هستی."},
+            {"role": "system", "content": "تو یک ویراستار متخصص فارسی و تدوینگر حرفه‌ای هستی. فقط خروجی JSON بده."},
             {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        response_format={"type": "json_object"}
+        ]
     )
     
-    edl_text = response.choices[0].message.content
-    return json.loads(edl_text)
+    # استخراج JSON از پاسخ مدل
+    response_text = response['message']['content']
+    # پاکسازی متن در صورت وجود توضیحات اضافی
+    try:
+        # پیدا کردن JSON بین { و }
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        json_str = response_text[start:end]
+        return json.loads(json_str)
+    except:
+        # اگر مدل JSON خالص برگرداند
+        return json.loads(response_text)
 
 # =============== اجرای تدوین با FFmpeg ===============
 def perform_editing(edl_data, output_path):
@@ -109,21 +113,23 @@ def perform_editing(edl_data, output_path):
 class EditingApp:
     def __init__(self, root):
         self.root = root
-        root.title("تدوین خودکار مصاحبه‌های فارسی")
-        root.geometry("700x600")
+        root.title("تدوین خودکار مصاحبه‌های فارسی (با Ollama)")
+        root.geometry("750x650")
         root.configure(bg='#f0f0f0')
         
         # متغیرها
         self.video_files = []
-        self.api_key_var = tk.StringVar()
-        self.model_var = tk.StringVar(value="large-v3")
+        # مدل Whisper
+        self.whisper_model_var = tk.StringVar(value="large-v3")
         self.device_var = tk.StringVar(value="cpu")
+        # مدل Ollama (جداگانه)
+        self.ollama_model_var = tk.StringVar(value="partai/dorna-llama3:8b-instruct-q5_0")
         self.log_text = None
         
         self._build_ui()
     
     def _build_ui(self):
-        # frame بالایی برای انتخاب فایل
+        # ====== بخش انتخاب فایل ======
         top_frame = tk.Frame(self.root, bg='#f0f0f0')
         top_frame.pack(pady=10, padx=10, fill='x')
         
@@ -133,33 +139,41 @@ class EditingApp:
         self.file_label = tk.Label(top_frame, text="هیچ فایلی انتخاب نشده", bg='#f0f0f0', font=('Tahoma', 9))
         self.file_label.pack(side='left', padx=10, fill='x', expand=True)
         
-        # ورودی API Key
-        key_frame = tk.Frame(self.root, bg='#f0f0f0')
-        key_frame.pack(pady=5, padx=10, fill='x')
-        tk.Label(key_frame, text="API Key OpenAI:", bg='#f0f0f0').pack(side='left')
-        tk.Entry(key_frame, textvariable=self.api_key_var, width=50, show='*').pack(side='left', padx=5)
-        
-        # تنظیمات مدل
+        # ====== تنظیمات مدل‌ها ======
         settings_frame = tk.Frame(self.root, bg='#f0f0f0')
         settings_frame.pack(pady=5, padx=10, fill='x')
+        
+        # Whisper
         tk.Label(settings_frame, text="مدل Whisper:", bg='#f0f0f0').pack(side='left')
-        model_options = ["tiny", "base", "small", "medium", "large-v3"]
-        tk.OptionMenu(settings_frame, self.model_var, *model_options).pack(side='left', padx=5)
+        whisper_options = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
+        tk.OptionMenu(settings_frame, self.whisper_model_var, *whisper_options).pack(side='left', padx=5)
+        
         tk.Label(settings_frame, text="دستگاه:", bg='#f0f0f0').pack(side='left', padx=(20,0))
         tk.OptionMenu(settings_frame, self.device_var, "cpu", "cuda").pack(side='left', padx=5)
         
-        # دکمه شروع
+        # Ollama
+        tk.Label(settings_frame, text="مدل Ollama:", bg='#f0f0f0').pack(side='left', padx=(20,0))
+        ollama_options = [
+            "partai/dorna-llama3:8b-instruct-q5_0",
+            "mshojaei77/gemma3persian",
+            "llama3.2:3b",
+            "mistral:7b",
+            "zharfap/zharfa-open:7b"
+        ]
+        tk.OptionMenu(settings_frame, self.ollama_model_var, *ollama_options).pack(side='left', padx=5)
+        
+        # ====== دکمه شروع ======
         self.start_btn = tk.Button(self.root, text="شروع تدوین", command=self.start_editing,
                                    bg='#2196F3', fg='white', font=('Tahoma', 12), height=2)
         self.start_btn.pack(pady=10)
         
-        # لاگ
+        # ====== لاگ ======
         self.log_text = scrolledtext.ScrolledText(self.root, height=20, font=('Tahoma', 9))
         self.log_text.pack(padx=10, pady=5, fill='both', expand=True)
         self.log_text.insert(tk.END, "👉 منتظر شروع عملیات...\n")
         self.log_text.config(state='disabled')
         
-        # نوار پیشرفت
+        # ====== نوار پیشرفت ======
         self.progress = ttk.Progressbar(self.root, orient='horizontal', length=400, mode='determinate')
         self.progress.pack(pady=5)
     
@@ -188,11 +202,7 @@ class EditingApp:
         if not self.video_files:
             messagebox.showwarning("خطا", "لطفاً ابتدا فایل‌های ویدئویی را انتخاب کنید.")
             return
-        if not self.api_key_var.get().strip():
-            messagebox.showwarning("خطا", "لطفاً کلید API خود را وارد کنید.")
-            return
         
-        # غیرفعال کردن دکمه
         self.start_btn.config(state='disabled')
         self.progress['value'] = 0
         self.log("🚀 شروع فرآیند تدوین...")
@@ -202,29 +212,37 @@ class EditingApp:
     
     def _process(self):
         try:
+            # ===== مرحله ۱: Whisper =====
             self.log("📥 مرحله ۱: تبدیل گفتار به متن با Whisper...")
             all_transcriptions = []
             total = len(self.video_files)
             for idx, video_path in enumerate(self.video_files, 1):
                 self.log(f"   پردازش فایل {idx}/{total}: {Path(video_path).name}")
-                words = transcribe_video(video_path, model_size=self.model_var.get(), device=self.device_var.get())
+                words = transcribe_video(
+                    video_path,
+                    model_size=self.whisper_model_var.get(),
+                    device=self.device_var.get()
+                )
                 all_transcriptions.append({
                     "file": Path(video_path).name,
                     "full_path": video_path,
                     "words": words
                 })
-                self.progress['value'] = (idx / total) * 30  # 30% برای Whisper
+                self.progress['value'] = (idx / total) * 30
                 self.root.update_idletasks()
             self.log("✅ تبدیل به متن با موفقیت انجام شد.")
             
-            # ارسال به LLM
-            self.log("🧠 مرحله ۲: ارسال به هوش مصنوعی و دریافت برنامه تدوین...")
-            edl_json = get_edl_from_llm(all_transcriptions, self.api_key_var.get())
+            # ===== مرحله ۲: Ollama =====
+            self.log("🧠 مرحله ۲: ارسال به هوش مصنوعی محلی (Ollama) و دریافت برنامه تدوین...")
+            edl_json = get_edl_from_ollama(
+                all_transcriptions,
+                model_name=self.ollama_model_var.get()
+            )
             self.log(f"✅ برنامه تدوین دریافت شد: {len(edl_json['clips'])} کلیپ انتخاب شده.")
             self.progress['value'] = 70
             self.root.update_idletasks()
             
-            # ساخت فایل خروجی
+            # ===== مرحله ۳: انتخاب مسیر خروجی =====
             output_file = filedialog.asksaveasfilename(
                 defaultextension=".mp4",
                 filetypes=[("MP4 files", "*.mp4")],
@@ -235,6 +253,7 @@ class EditingApp:
                 self._finish()
                 return
             
+            # ===== مرحله ۴: اجرای FFmpeg =====
             self.log("✂️ مرحله ۳: اجرای تدوین با FFmpeg...")
             # نیاز به تصحیح مسیر فایل‌های مبدأ در EDL (چون LLM فقط نام فایل را می‌دهد، باید مسیر کامل را بیابیم)
             file_map = {Path(f).name: f for f in self.video_files}
