@@ -1,0 +1,6 @@
+arabic_reshaper==3.0.1
+faster_whisper==1.2.1
+ffmpeg_python==0.2.0
+ollama==0.6.2
+opencv_python==5.0.0.93
+Pillow==12.3.0
