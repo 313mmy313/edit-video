@@ -13,6 +13,28 @@ from faster_whisper import WhisperModel
 import ffmpeg
 import ollama
 
+try:
+    import arabic_reshaper
+    ARABIC_RESHAPER_AVAILABLE = True
+except ImportError:
+    ARABIC_RESHAPER_AVAILABLE = False
+
+try:
+    from bidi.algorithm import get_display
+    BIDI_AVAILABLE = True
+except ImportError:
+    BIDI_AVAILABLE = False
+
+def reshape_persian_text(text):
+    """اتصال حروف و تنظیم ترتیب نمایش برای متن فارسی"""
+    if not text:
+        return text
+    if ARABIC_RESHAPER_AVAILABLE:
+        text = arabic_reshaper.reshape(text)
+    if BIDI_AVAILABLE:
+        text = get_display(text)
+    return text
+
 # ================================================================
 #  بخش ۱: تبدیل گفتار به متن (Whisper)
 # ================================================================
@@ -138,7 +160,7 @@ class VideoEditorApp:
         self.corrected_texts = []
         self.edl_json = None
         
-        # متغیرهای مدل
+        # متغیرهای مدل (افزوده‌شده)
         self.whisper_model_var = tk.StringVar(value="large-v3")
         self.device_var = tk.StringVar(value="cpu")
         self.ollama_model_var = tk.StringVar(value="partai/dorna-llama3:8b-instruct-q5_0")
@@ -158,6 +180,7 @@ class VideoEditorApp:
         toolbar = tk.Frame(self.root, bg='#e0e0e0')
         toolbar.pack(side='top', fill='x', padx=5, pady=5)
         
+        # دکمه‌های اصلی
         tk.Button(toolbar, text="Select Video Files", command=self.select_files,
                   bg='#4CAF50', fg='white').pack(side='left', padx=2)
         
@@ -183,6 +206,25 @@ class VideoEditorApp:
         tk.Button(toolbar, text="Export Final Video", command=self.export_final,
                   bg='#4CAF50', fg='white').pack(side='left', padx=2)
         
+        # ===== انتخاب مدل‌ها (افزوده‌شده) =====
+        # Whisper model
+        tk.Label(toolbar, text="Whisper:", bg='#e0e0e0').pack(side='left', padx=(10,0))
+        whisper_combo = ttk.Combobox(toolbar, textvariable=self.whisper_model_var,
+                                     values=["tiny", "base", "small", "medium", "large-v3", "large-v2"],
+                                     width=10, state='readonly')
+        whisper_combo.pack(side='left', padx=2)
+        
+        # Device
+        tk.Label(toolbar, text="Device:", bg='#e0e0e0').pack(side='left', padx=(5,0))
+        device_combo = ttk.Combobox(toolbar, textvariable=self.device_var,
+                                    values=["cpu", "cuda"], width=6, state='readonly')
+        device_combo.pack(side='left', padx=2)
+        
+        # Ollama model
+        tk.Label(toolbar, text="Ollama model:", bg='#e0e0e0').pack(side='left', padx=(10,0))
+        ollama_entry = tk.Entry(toolbar, textvariable=self.ollama_model_var, width=20)
+        ollama_entry.pack(side='left', padx=2)
+        
         # اطلاعات فایل فعلی
         self.file_info = tk.Label(toolbar, text="No file loaded", bg='#e0e0e0')
         self.file_info.pack(side='right', padx=10)
@@ -193,14 +235,25 @@ class VideoEditorApp:
         video_frame.pack_propagate(False)
         self.video_canvas = tk.Canvas(video_frame, bg='black', width=640, height=360)
         self.video_canvas.pack(fill='both', expand=True)
+        # بایند برای تغییر اندازه (افزوده‌شده)
+        self.video_canvas.bind('<Configure>', self.on_canvas_resize)
         
         # ===== پنل متن (راست) =====
         text_frame = tk.Frame(self.root, bg='#f0f0f0')
         text_frame.pack(side='right', padx=5, pady=5, fill='both', expand=True)
-        
+
         self.text_widget = tk.Text(text_frame, wrap='word', font=('Tahoma', 11), height=20)
         self.text_widget.pack(side='top', fill='both', expand=True)
-        
+
+        # تنظیم جهت RTL (در نسخه‌های جدید Tk)
+        try:
+            self.text_widget.configure(direction='rtl')
+        except:
+            pass  # اگر پشتیبانی نشد، از تگ rtl استفاده می‌کنیم
+
+        # تگ برای راست‌چین کردن محتوا
+        self.text_widget.tag_configure("rtl", justify='right')
+
         scroll = tk.Scrollbar(text_frame, command=self.text_widget.yview)
         scroll.pack(side='right', fill='y')
         self.text_widget.config(yscrollcommand=scroll.set)
@@ -296,7 +349,7 @@ class VideoEditorApp:
             self.text_widget.insert(tk.END, "No transcription yet. Click 'Transcribe All'.")
     
     def show_frame_at(self, ms):
-        """Show frame at given millisecond"""
+        """Show frame at given millisecond with proper scaling (افزوده‌شده)"""
         if self.cap is None:
             return
         # تبدیل میلی‌ثانیه به فریم
@@ -308,11 +361,40 @@ class VideoEditorApp:
             self.display_frame(frame)
     
     def display_frame(self, frame):
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame)
+        """Display frame scaled to fit canvas while preserving aspect ratio (افزوده‌شده)"""
+        # دریافت ابعاد فعلی canvas
+        canvas_width = self.video_canvas.winfo_width()
+        canvas_height = self.video_canvas.winfo_height()
+        if canvas_width <= 1 or canvas_height <= 1:
+            canvas_width = 640
+            canvas_height = 360
+        
+        h, w = frame.shape[:2]
+        # محاسبه نسبت
+        scale_w = canvas_width / w
+        scale_h = canvas_height / h
+        scale = min(scale_w, scale_h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # تغییر اندازه
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        # تبدیل به RGB
+        resized_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(resized_rgb)
         imgtk = ImageTk.PhotoImage(image=img)
-        self.video_canvas.create_image(0, 0, anchor='nw', image=imgtk)
+        
+        # پاک کردن canvas و نمایش در مرکز
+        self.video_canvas.delete("all")
+        x_center = (canvas_width - new_w) // 2
+        y_center = (canvas_height - new_h) // 2
+        self.video_canvas.create_image(x_center, y_center, anchor='nw', image=imgtk)
         self.video_canvas.image = imgtk  # keep reference
+    
+    def on_canvas_resize(self, event):
+        """هنگام تغییر اندازه canvas، فریم فعلی را دوباره نمایش بده (افزوده‌شده)"""
+        if self.cap is not None:
+            self.show_frame_at(self.current_time)
     
     # ----------------------------------------------------------------
     #  کنترل‌های پخش
@@ -391,18 +473,33 @@ class VideoEditorApp:
         if index >= len(self.transcriptions):
             return
         words = self.transcriptions[index]
-        if self.corrected_texts and index < len(self.corrected_texts) and self.corrected_texts[index]:
-            self.text_widget.insert(tk.END, self.corrected_texts[index])
-            return
         
+        # اگر متن تصحیح‌شده موجود است
+        if self.corrected_texts and index < len(self.corrected_texts) and self.corrected_texts[index]:
+            text = self.corrected_texts[index]
+            text = reshape_persian_text(text)
+            self.text_widget.insert(tk.END, text, ('rtl',))
+            return
+
+        # ساخت لیستی از کلمات پردازش‌شده
+        reshaped_words = []
         for w in words:
             word_text = w['text']
-            start = w['start']
+            # reshape هر کلمه به‌طور جداگانه برای اتصال حروف
+            if ARABIC_RESHAPER_AVAILABLE:
+                word_text = arabic_reshaper.reshape(word_text)
+            if BIDI_AVAILABLE:
+                word_text = get_display(word_text)
+            reshaped_words.append((word_text, w['start']))
+        
+        # معکوس کردن لیست برای نمایش راست‌به‌چپ
+        for word_text, start in reversed(reshaped_words):
             tag_name = f"word_{start}"
-            self.text_widget.insert(tk.END, word_text + " ", (tag_name,))
+            # درج کلمه با یک فاصله بعد از آن
+            self.text_widget.insert(tk.END, word_text + " ", (tag_name, 'rtl'))
             self.text_widget.tag_config(tag_name, foreground="blue", underline=True)
             self.text_widget.tag_bind(tag_name, "<Button-1>",
-                                      lambda e, s=start: self.seek_and_play(s))
+                                    lambda e, s=start: self.seek_and_play(s))
         self.log(f"Displayed {len(words)} words for file {index+1}")
     
     def seek_and_play(self, seconds):
@@ -456,7 +553,9 @@ class VideoEditorApp:
                 self.log(f"✅ Loaded corrected texts from {file_path}")
                 if self.current_video_index < len(self.corrected_texts):
                     self.text_widget.delete('1.0', tk.END)
-                    self.text_widget.insert(tk.END, self.corrected_texts[self.current_video_index])
+                    text = self.corrected_texts[self.current_video_index]
+                    text = reshape_persian_text(text)
+                    self.text_widget.insert(tk.END, text, ('rtl',))
             else:
                 messagebox.showerror("Error", "Invalid file format.")
         except Exception as e:
@@ -511,7 +610,7 @@ class VideoEditorApp:
             self.root.after(0, lambda: self.transcribe_btn.config(state='normal'))
     
     # ----------------------------------------------------------------
-    #  ارسال به Ollama
+    #  ارسال به Ollama + نمایش و ویرایش EDL (افزوده‌شده)
     # ----------------------------------------------------------------
     def send_to_ollama(self):
         if not self.transcriptions or not self.video_files:
@@ -537,16 +636,53 @@ class VideoEditorApp:
         self.log("🧠 Sending to Ollama for editing decision...")
         self.progress['value'] = 60
         try:
-            self.edl_json = get_edl_from_ollama(
+            edl_json = get_edl_from_ollama(
                 final_transcriptions,
                 model_name=self.ollama_model_var.get()
             )
-            self.log(f"✅ EDL received: {len(self.edl_json['clips'])} clips selected.")
+            self.log(f"✅ EDL received: {len(edl_json['clips'])} clips selected.")
             self.progress['value'] = 80
-            messagebox.showinfo("Success", f"Ollama selected {len(self.edl_json['clips'])} clips.")
+            # نمایش پنجره ویرایش (افزوده‌شده)
+            self.show_edl_editor(edl_json)
         except Exception as e:
             self.log(f"❌ Error from Ollama: {e}")
             messagebox.showerror("Error", str(e))
+    
+    def show_edl_editor(self, edl_data):
+        """پنجره ویرایش EDL (افزوده‌شده)"""
+        editor_window = tk.Toplevel(self.root)
+        editor_window.title("ویرایش EDL (لیست تصمیم تدوین)")
+        editor_window.geometry("800x600")
+        
+        # ویجت متن برای نمایش و ویرایش JSON
+        text_area = scrolledtext.ScrolledText(editor_window, wrap='word', font=('Tahoma', 10))
+        text_area.pack(side='top', fill='both', expand=True, padx=5, pady=5)
+        # نمایش JSON زیبا
+        pretty_json = json.dumps(edl_data, ensure_ascii=False, indent=2)
+        text_area.insert('1.0', pretty_json)
+        
+        # دکمه‌ها
+        btn_frame = tk.Frame(editor_window)
+        btn_frame.pack(side='bottom', fill='x', pady=5)
+        
+        def apply_edl():
+            try:
+                edited_text = text_area.get('1.0', tk.END).strip()
+                new_edl = json.loads(edited_text)
+                # بررسی ساختار
+                if not isinstance(new_edl, dict) or 'clips' not in new_edl:
+                    raise ValueError("JSON must contain 'clips' key.")
+                self.edl_json = new_edl
+                self.log("✅ EDL edited and applied.")
+                self.progress['value'] = 80
+                editor_window.destroy()
+            except Exception as e:
+                messagebox.showerror("خطا", f"JSON نامعتبر: {e}")
+        
+        tk.Button(btn_frame, text="تأیید و ادامه", command=apply_edl,
+                  bg='#4CAF50', fg='white', padx=10).pack(side='right', padx=5)
+        tk.Button(btn_frame, text="لغو", command=editor_window.destroy,
+                  bg='#f44336', fg='white', padx=10).pack(side='right', padx=5)
     
     # ----------------------------------------------------------------
     #  ساخت ویدئوی نهایی
