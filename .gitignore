@@ -225,3 +225,6 @@ sketch
 # End of https://www.toptal.com/developers/gitignore/api/django,nextjs,react
 
 venv/
+*.mp4
+*.MP4
+*.png

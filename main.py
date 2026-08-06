@@ -1,24 +1,27 @@
 import os
 import json
-import tempfile
-import subprocess
+import threading
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox, ttk
 from pathlib import Path
-import threading
 import time
+import cv2
+from PIL import Image, ImageTk
 
-# کتابخانه‌های اصلی
+# --- کتابخانه‌های اصلی ---
 from faster_whisper import WhisperModel
 import ffmpeg
 import ollama
 
-# =============== بخش تبدیل گفتار به متن با Whisper ===============
+# ================================================================
+#  بخش ۱: تبدیل گفتار به متن (Whisper)
+# ================================================================
+
 def transcribe_video(video_path, model_size="large-v3", device="cpu"):
     """
-    تبدیل صوت ویدئو به متن با تایم‌کدهای کلمه (فارسی)
+    Convert video audio to text with word-level timestamps (Persian)
     """
-    model = WhisperModel(model_size, device=device, compute_type="int8" if device=="cpu" else "float16")
+    model = WhisperModel(model_size, device=device, compute_type="int8" if device == "cpu" else "float16")
     segments, info = model.transcribe(
         video_path,
         language="fa",
@@ -36,147 +39,204 @@ def transcribe_video(video_path, model_size="large-v3", device="cpu"):
             })
     return words_data
 
-# =============== ارتباط با LLM برای اصلاح و تولید EDL ===============
-def get_edl_from_llm(transcriptions, model_name="partai/dorna-llama3:8b-instruct-q5_0"):
+
+# ================================================================
+#  بخش ۲: ارتباط با Ollama (محلی) برای تولید EDL
+# ================================================================
+
+def get_edl_from_ollama(transcriptions, model_name="partai/dorna-llama3:8b-instruct-q5_0"):
     """
-    ارسال متن‌ها به مدل محلی Ollama و دریافت JSON تدوین
+    Send transcribed texts + timestamps to local Ollama model and get editing decision list (JSON)
     """
     prompt = f"""
-    من چندین فایل مصاحبه به زبان فارسی دارم که متن و تایم‌کد آن‌ها را با Whisper استخراج کرده‌ام.
-    لطفاً این کارها را انجام بده:
+    I have several Persian interview video files with their Whisper transcriptions and timestamps.
+    Please do the following:
 
-    ۱. خطاهای املایی و نگارشی متن‌های فارسی را اصلاح کن (مثلاً «میرم» را به «می‌روم» تبدیل کن).
-    ۲. همهٔ مصاحبه‌ها را از نظر محتوایی بررسی کن و یک «مضمون مشترک» بین آن‌ها پیدا کن.
-    ۳. برای آن مضمون، گویاترین و تأثیرگذارترین جملات را از بین همهٔ مصاحبه‌ها انتخاب کن. اگر جمله‌ای تکراری بود، فقط بهترین نسخه‌اش را نگه دار.
-    ۴. در نهایت، یک خروجی JSON با فرمت زیر به من بده:
+    1. Correct spelling and grammar errors in the Persian text (e.g., change "میرم" to "می‌روم").
+    2. Analyze all interviews to find a common theme.
+    3. For that theme, select the most eloquent and impactful sentences from all interviews. Remove repetitions.
+    4. Finally, output a JSON with the following format:
 
     {{
       "clips": [
-        {{"source_file": "نام_فایل_اصلی.mp4", "start_time": ۱۰.۵, "end_time": ۲۵.۳}},
-        {{"source_file": "نام_فایل_دیگر.mp4", "start_time": ۴۲.۰, "end_time": ۶۰.۸}}
+        {{"source_file": "original_filename.mp4", "start_time": 10.5, "end_time": 25.3}},
+        {{"source_file": "another_file.mp4", "start_time": 42.0, "end_time": 60.8}}
       ]
     }}
 
-    توجه: source_file باید دقیقاً همان نام فایلی باشد که در ورودی داده‌ام.
-    حالا متن‌های خروجی Whisper به همراه نام فایل مربوطه:
+    Important: "source_file" must exactly match the filenames I provide.
+
+    Here are the Whisper outputs with filenames:
 
     {json.dumps(transcriptions, ensure_ascii=False, indent=2)}
 
-    فقط JSON را برگردان و هیچ توضیح دیگری نده.
+    Return ONLY the JSON, no extra text.
     """
     
     response = ollama.chat(
         model=model_name,
         messages=[
-            {"role": "system", "content": "تو یک ویراستار متخصص فارسی و تدوینگر حرفه‌ای هستی. فقط خروجی JSON بده."},
+            {"role": "system", "content": "You are a professional Persian editor and video editor. Output only JSON."},
             {"role": "user", "content": prompt}
         ]
     )
     
-    # استخراج JSON از پاسخ مدل
-    response_text = response['message']['content']
-    # پاکسازی متن در صورت وجود توضیحات اضافی
+    raw_text = response['message']['content']
+    # extract JSON from possible extra text
     try:
-        # پیدا کردن JSON بین { و }
-        start = response_text.find('{')
-        end = response_text.rfind('}') + 1
-        json_str = response_text[start:end]
-        return json.loads(json_str)
-    except:
-        # اگر مدل JSON خالص برگرداند
-        return json.loads(response_text)
+        start = raw_text.find('{')
+        end = raw_text.rfind('}') + 1
+        if start != -1 and end != 0:
+            json_str = raw_text[start:end]
+            return json.loads(json_str)
+        else:
+            return json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON from model: {raw_text}") from e
 
-# =============== اجرای تدوین با FFmpeg ===============
+
+# ================================================================
+#  بخش ۳: اجرای تدوین با FFmpeg
+# ================================================================
+
 def perform_editing(edl_data, output_path):
     """
-    برش و ترکیب ویدئوها بر اساس JSON
+    Cut and concatenate videos based on EDL JSON
     """
     clips = []
     for item in edl_data["clips"]:
         source = Path(item["source_file"])
         if not source.exists():
-            raise FileNotFoundError(f"فایل {source} یافت نشد!")
+            raise FileNotFoundError(f"File not found: {source}")
         start = float(item["start_time"])
         end = float(item["end_time"])
-        # برش
         trimmed = ffmpeg.input(str(source), ss=start, to=end)
         clips.append(trimmed)
     
     if not clips:
-        raise ValueError("هیچ کلیپی برای ترکیب وجود ندارد.")
+        raise ValueError("No clips to concatenate.")
     
-    # اتصال همه کلیپ‌ها
     joined = ffmpeg.concat(*clips, v=1, a=1).output(output_path)
     joined.run(overwrite_output=True)
 
-# =============== کلاس رابط کاربری ===============
-class EditingApp:
+
+# ================================================================
+#  بخش ۴: رابط کاربری اصلی (بدون VLC)
+# ================================================================
+
+class VideoEditorApp:
     def __init__(self, root):
         self.root = root
-        root.title("تدوین خودکار مصاحبه‌های فارسی (با Ollama)")
-        root.geometry("750x650")
+        root.title("Persian Interview Editor (Whisper + Ollama + FFmpeg)")
+        root.geometry("1100x750")
         root.configure(bg='#f0f0f0')
         
         # متغیرها
         self.video_files = []
-        # مدل Whisper
+        self.current_video_index = 0
+        self.transcriptions = []
+        self.corrected_texts = []
+        self.edl_json = None
+        
+        # متغیرهای مدل
         self.whisper_model_var = tk.StringVar(value="large-v3")
         self.device_var = tk.StringVar(value="cpu")
-        # مدل Ollama (جداگانه)
         self.ollama_model_var = tk.StringVar(value="partai/dorna-llama3:8b-instruct-q5_0")
-        self.log_text = None
         
+        # OpenCV video capture
+        self.cap = None
+        self.is_playing = False
+        self.current_time = 0  # milliseconds
+        self.total_duration = 0
+        
+        # ساخت UI
         self._build_ui()
+        self.text_widget.tag_configure("highlight", background="yellow")
     
     def _build_ui(self):
-        # ====== بخش انتخاب فایل ======
-        top_frame = tk.Frame(self.root, bg='#f0f0f0')
-        top_frame.pack(pady=10, padx=10, fill='x')
+        # ===== نوار ابزار بالا =====
+        toolbar = tk.Frame(self.root, bg='#e0e0e0')
+        toolbar.pack(side='top', fill='x', padx=5, pady=5)
         
-        tk.Button(top_frame, text="انتخاب فایل‌های ویدئویی", command=self.select_files,
-                  bg='#4CAF50', fg='white', font=('Tahoma', 10)).pack(side='left', padx=5)
+        tk.Button(toolbar, text="Select Video Files", command=self.select_files,
+                  bg='#4CAF50', fg='white').pack(side='left', padx=2)
         
-        self.file_label = tk.Label(top_frame, text="هیچ فایلی انتخاب نشده", bg='#f0f0f0', font=('Tahoma', 9))
-        self.file_label.pack(side='left', padx=10, fill='x', expand=True)
+        self.transcribe_btn = tk.Button(toolbar, text="Transcribe All", command=self.transcribe_all,
+                                bg='#2196F3', fg='white')
+        self.transcribe_btn.pack(side='left', padx=2)
         
-        # ====== تنظیمات مدل‌ها ======
-        settings_frame = tk.Frame(self.root, bg='#f0f0f0')
-        settings_frame.pack(pady=5, padx=10, fill='x')
+        tk.Button(toolbar, text="Previous Video", command=self.prev_video,
+                  bg='#FF9800', fg='white').pack(side='left', padx=2)
         
-        # Whisper
-        tk.Label(settings_frame, text="مدل Whisper:", bg='#f0f0f0').pack(side='left')
-        whisper_options = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
-        tk.OptionMenu(settings_frame, self.whisper_model_var, *whisper_options).pack(side='left', padx=5)
+        tk.Button(toolbar, text="Next Video", command=self.next_video,
+                  bg='#FF9800', fg='white').pack(side='left', padx=2)
         
-        tk.Label(settings_frame, text="دستگاه:", bg='#f0f0f0').pack(side='left', padx=(20,0))
-        tk.OptionMenu(settings_frame, self.device_var, "cpu", "cuda").pack(side='left', padx=5)
+        tk.Button(toolbar, text="Save Corrected Text", command=self.save_corrected_text,
+                  bg='#9C27B0', fg='white').pack(side='left', padx=2)
         
-        # Ollama
-        tk.Label(settings_frame, text="مدل Ollama:", bg='#f0f0f0').pack(side='left', padx=(20,0))
-        ollama_options = [
-            "partai/dorna-llama3:8b-instruct-q5_0",
-            "mshojaei77/gemma3persian",
-            "llama3.2:3b",
-            "mistral:7b",
-            "zharfap/zharfa-open:7b"
-        ]
-        tk.OptionMenu(settings_frame, self.ollama_model_var, *ollama_options).pack(side='left', padx=5)
+        tk.Button(toolbar, text="Load Corrected Text", command=self.load_corrected_text,
+                  bg='#9C27B0', fg='white').pack(side='left', padx=2)
         
-        # ====== دکمه شروع ======
-        self.start_btn = tk.Button(self.root, text="شروع تدوین", command=self.start_editing,
-                                   bg='#2196F3', fg='white', font=('Tahoma', 12), height=2)
-        self.start_btn.pack(pady=10)
+        tk.Button(toolbar, text="Send to Ollama & Edit", command=self.send_to_ollama,
+                  bg='#F44336', fg='white').pack(side='left', padx=2)
         
-        # ====== لاگ ======
-        self.log_text = scrolledtext.ScrolledText(self.root, height=20, font=('Tahoma', 9))
-        self.log_text.pack(padx=10, pady=5, fill='both', expand=True)
-        self.log_text.insert(tk.END, "👉 منتظر شروع عملیات...\n")
+        tk.Button(toolbar, text="Export Final Video", command=self.export_final,
+                  bg='#4CAF50', fg='white').pack(side='left', padx=2)
+        
+        # اطلاعات فایل فعلی
+        self.file_info = tk.Label(toolbar, text="No file loaded", bg='#e0e0e0')
+        self.file_info.pack(side='right', padx=10)
+        
+        # ===== پنل ویدئو (چپ) با Canvas =====
+        video_frame = tk.Frame(self.root, bg='black', width=640, height=360)
+        video_frame.pack(side='left', padx=5, pady=5, fill='both', expand=True)
+        video_frame.pack_propagate(False)
+        self.video_canvas = tk.Canvas(video_frame, bg='black', width=640, height=360)
+        self.video_canvas.pack(fill='both', expand=True)
+        
+        # ===== پنل متن (راست) =====
+        text_frame = tk.Frame(self.root, bg='#f0f0f0')
+        text_frame.pack(side='right', padx=5, pady=5, fill='both', expand=True)
+        
+        self.text_widget = tk.Text(text_frame, wrap='word', font=('Tahoma', 11), height=20)
+        self.text_widget.pack(side='top', fill='both', expand=True)
+        
+        scroll = tk.Scrollbar(text_frame, command=self.text_widget.yview)
+        scroll.pack(side='right', fill='y')
+        self.text_widget.config(yscrollcommand=scroll.set)
+        
+        # ===== کنترل‌های پخش =====
+        controls = tk.Frame(self.root, bg='#e0e0e0')
+        controls.pack(side='bottom', fill='x', padx=5, pady=5)
+        
+        self.play_btn = tk.Button(controls, text="Play", command=self.play_pause, width=8)
+        self.play_btn.pack(side='left', padx=2)
+        self.stop_btn = tk.Button(controls, text="Stop", command=self.stop, width=8)
+        self.stop_btn.pack(side='left', padx=2)
+        
+        self.time_slider = tk.Scale(controls, from_=0, to=100, orient='horizontal', length=400,
+                                    command=self.slider_changed)
+        self.time_slider.pack(side='left', padx=10, fill='x', expand=True)
+        
+        self.time_label = tk.Label(controls, text="00:00 / 00:00", bg='#e0e0e0')
+        self.time_label.pack(side='left', padx=5)
+        
+        # ===== نوار پیشرفت کلی =====
+        self.progress = ttk.Progressbar(self.root, orient='horizontal', length=400, mode='determinate')
+        self.progress.pack(side='bottom', fill='x', padx=5, pady=2)
+        
+        # ===== لاگ =====
+        self.log_text = scrolledtext.ScrolledText(self.root, height=5, font=('Tahoma', 8))
+        self.log_text.pack(side='bottom', fill='x', padx=5, pady=5)
+        self.log_text.insert(tk.END, "Ready.\n")
         self.log_text.config(state='disabled')
         
-        # ====== نوار پیشرفت ======
-        self.progress = ttk.Progressbar(self.root, orient='horizontal', length=400, mode='determinate')
-        self.progress.pack(pady=5)
+        # تایمر برای به‌روزرسانی
+        self.update_timer = None
     
+    # ----------------------------------------------------------------
+    #  توابع لاگ
+    # ----------------------------------------------------------------
     def log(self, msg):
         self.log_text.config(state='normal')
         self.log_text.insert(tk.END, msg + "\n")
@@ -184,100 +244,350 @@ class EditingApp:
         self.log_text.config(state='disabled')
         self.root.update_idletasks()
     
+    # ----------------------------------------------------------------
+    #  انتخاب فایل‌ها
+    # ----------------------------------------------------------------
     def select_files(self):
         files = filedialog.askopenfilenames(
-            title="انتخاب فایل‌های ویدئویی",
+            title="Select video files",
             filetypes=[("MP4 files", "*.mp4"), ("All files", "*.*")]
         )
         if files:
             self.video_files = list(files)
-            self.file_label.config(text=f"{len(files)} فایل انتخاب شد")
-            self.log(f"✅ {len(files)} فایل انتخاب شد.")
+            self.current_video_index = 0
+            self.transcriptions = []
+            self.corrected_texts = []
+            self.file_info.config(text=f"{len(files)} files loaded")
+            self.log(f"✅ {len(files)} video files selected.")
             for f in files:
                 self.log(f"   - {Path(f).name}")
+            self.load_video(0)
         else:
-            self.log("⚠️ هیچ فایلی انتخاب نشد.")
+            self.log("⚠️ No files selected.")
     
-    def start_editing(self):
-        if not self.video_files:
-            messagebox.showwarning("خطا", "لطفاً ابتدا فایل‌های ویدئویی را انتخاب کنید.")
+    # ----------------------------------------------------------------
+    #  بارگذاری ویدئو با OpenCV
+    # ----------------------------------------------------------------
+    def load_video(self, index):
+        if not self.video_files or index < 0 or index >= len(self.video_files):
+            return
+        self.current_video_index = index
+        video_path = self.video_files[index]
+        self.file_info.config(text=f"File {index+1}/{len(self.video_files)}: {Path(video_path).name}")
+        
+        # بستن قبلی
+        if self.cap:
+            self.cap.release()
+        self.cap = cv2.VideoCapture(video_path)
+        self.total_duration = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.cap.get(cv2.CAP_PROP_FPS) * 1000)
+        self.current_time = 0
+        self.is_playing = False
+        self.play_btn.config(text="Play")
+        
+        # نمایش اولین فریم
+        self.show_frame_at(0)
+        self.start_update_timer()
+        
+        # نمایش متن متناظر (اگر موجود باشد)
+        if self.transcriptions and index < len(self.transcriptions):
+            self.display_transcription(index)
+        else:
+            self.text_widget.delete('1.0', tk.END)
+            self.text_widget.insert(tk.END, "No transcription yet. Click 'Transcribe All'.")
+    
+    def show_frame_at(self, ms):
+        """Show frame at given millisecond"""
+        if self.cap is None:
+            return
+        # تبدیل میلی‌ثانیه به فریم
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        frame_number = int(ms / 1000 * fps)
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, frame = self.cap.read()
+        if ret:
+            self.display_frame(frame)
+    
+    def display_frame(self, frame):
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame)
+        imgtk = ImageTk.PhotoImage(image=img)
+        self.video_canvas.create_image(0, 0, anchor='nw', image=imgtk)
+        self.video_canvas.image = imgtk  # keep reference
+    
+    # ----------------------------------------------------------------
+    #  کنترل‌های پخش
+    # ----------------------------------------------------------------
+    def play_pause(self):
+        if self.cap is None:
+            return
+        if self.is_playing:
+            self.is_playing = False
+            self.play_btn.config(text="Play")
+        else:
+            self.is_playing = True
+            self.play_btn.config(text="Pause")
+            self.play_loop()
+    
+    def play_loop(self):
+        if not self.is_playing or self.cap is None:
+            return
+        ret, frame = self.cap.read()
+        if ret:
+            self.display_frame(frame)
+            # به‌روزرسانی زمان
+            self.current_time += 30  # حدود 30 میلی‌ثانیه
+            self.update_slider_and_label()
+            self.root.after(30, self.play_loop)
+        else:
+            # پایان ویدئو
+            self.is_playing = False
+            self.play_btn.config(text="Play")
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    def stop(self):
+        self.is_playing = False
+        self.play_btn.config(text="Play")
+        if self.cap:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.current_time = 0
+            self.show_frame_at(0)
+            self.update_slider_and_label()
+    
+    def slider_changed(self, value):
+        if self.cap:
+            ms = int(float(value) * self.total_duration / 100)
+            self.current_time = ms
+            self.show_frame_at(ms)
+            self.update_slider_and_label()
+    
+    def update_slider_and_label(self):
+        if self.total_duration > 0:
+            self.time_slider.set(100 * self.current_time / self.total_duration)
+            cur_str = self._format_time(self.current_time)
+            total_str = self._format_time(self.total_duration)
+            self.time_label.config(text=f"{cur_str} / {total_str}")
+    
+    def start_update_timer(self):
+        if self.update_timer:
+            self.root.after_cancel(self.update_timer)
+        self.update_ui()
+    
+    def update_ui(self):
+        if self.cap is not None:
+            self.update_slider_and_label()
+        self.update_timer = self.root.after(100, self.update_ui)
+    
+    def _format_time(self, ms):
+        s = ms // 1000
+        m = s // 60
+        s = s % 60
+        return f"{m:02d}:{s:02d}"
+    
+    # ----------------------------------------------------------------
+    #  نمایش متن
+    # ----------------------------------------------------------------
+    def display_transcription(self, index):
+        self.text_widget.delete('1.0', tk.END)
+        if index >= len(self.transcriptions):
+            return
+        words = self.transcriptions[index]
+        if self.corrected_texts and index < len(self.corrected_texts) and self.corrected_texts[index]:
+            self.text_widget.insert(tk.END, self.corrected_texts[index])
             return
         
-        self.start_btn.config(state='disabled')
-        self.progress['value'] = 0
-        self.log("🚀 شروع فرآیند تدوین...")
-        
-        # اجرا در یک ترد جداگانه تا GUI قفل نشود
-        threading.Thread(target=self._process, daemon=True).start()
+        for w in words:
+            word_text = w['text']
+            start = w['start']
+            tag_name = f"word_{start}"
+            self.text_widget.insert(tk.END, word_text + " ", (tag_name,))
+            self.text_widget.tag_config(tag_name, foreground="blue", underline=True)
+            self.text_widget.tag_bind(tag_name, "<Button-1>",
+                                      lambda e, s=start: self.seek_and_play(s))
+        self.log(f"Displayed {len(words)} words for file {index+1}")
     
-    def _process(self):
+    def seek_and_play(self, seconds):
+        ms = int(seconds * 1000)
+        self.current_time = ms
+        self.show_frame_at(ms)
+        self.update_slider_and_label()
+        if not self.is_playing:
+            self.is_playing = True
+            self.play_btn.config(text="Pause")
+            self.play_loop()
+    
+    # ----------------------------------------------------------------
+    #  توابع ناوبری بین فایل‌ها
+    # ----------------------------------------------------------------
+    def prev_video(self):
+        if self.current_video_index > 0:
+            self.load_video(self.current_video_index - 1)
+        else:
+            self.log("Already at first video.")
+    
+    def next_video(self):
+        if self.current_video_index < len(self.video_files) - 1:
+            self.load_video(self.current_video_index + 1)
+        else:
+            self.log("Already at last video.")
+    
+    # ----------------------------------------------------------------
+    #  متدهای ویرایش متن و ذخیره/بارگذاری
+    # ----------------------------------------------------------------
+    def save_corrected_text(self):
+        if self.current_video_index >= len(self.corrected_texts):
+            return
+        text = self.text_widget.get('1.0', tk.END).strip()
+        self.corrected_texts[self.current_video_index] = text
+        self.log(f"✅ Corrected text saved for file {self.current_video_index+1}")
+        messagebox.showinfo("Success", f"Text saved for file {self.current_video_index+1}")
+    
+    def load_corrected_text(self):
+        file_path = filedialog.askopenfilename(
+            title="Load corrected text",
+            filetypes=[("Text files", "*.txt"), ("JSON files", "*.json")]
+        )
+        if not file_path:
+            return
         try:
-            # ===== مرحله ۱: Whisper =====
-            self.log("📥 مرحله ۱: تبدیل گفتار به متن با Whisper...")
-            all_transcriptions = []
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list) and len(data) == len(self.video_files):
+                self.corrected_texts = data
+                self.log(f"✅ Loaded corrected texts from {file_path}")
+                if self.current_video_index < len(self.corrected_texts):
+                    self.text_widget.delete('1.0', tk.END)
+                    self.text_widget.insert(tk.END, self.corrected_texts[self.current_video_index])
+            else:
+                messagebox.showerror("Error", "Invalid file format.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+    
+    # ----------------------------------------------------------------
+    #  تبدیل متن با Whisper (با نمایش پیشرفت)
+    # ----------------------------------------------------------------
+    def transcribe_all(self):
+        if not self.video_files:
+            messagebox.showwarning("Warning", "Please select video files first.")
+            return
+        
+        self.transcribe_btn.config(state='disabled')
+        self.progress['value'] = 0
+        self.log("🚀 Starting transcription with Whisper...")
+        threading.Thread(target=self._transcribe_worker, daemon=True).start()
+
+    def _transcribe_worker(self):
+        """Worker thread for transcription"""
+        try:
             total = len(self.video_files)
+            self.transcriptions = []
+            self.corrected_texts = []
+            
             for idx, video_path in enumerate(self.video_files, 1):
-                self.log(f"   پردازش فایل {idx}/{total}: {Path(video_path).name}")
+                self.log(f"🔄 Transcribing file {idx}/{total}: {Path(video_path).name}")
+                self.root.after(0, lambda: self.progress.config(value=(idx-1)/total*50))
+                
                 words = transcribe_video(
                     video_path,
                     model_size=self.whisper_model_var.get(),
                     device=self.device_var.get()
                 )
-                all_transcriptions.append({
-                    "file": Path(video_path).name,
-                    "full_path": video_path,
+                self.transcriptions.append(words)
+                self.corrected_texts.append("")
+                
+                # به‌روزرسانی نوار پیشرفت
+                progress_val = (idx / total) * 50
+                self.root.after(0, lambda v=progress_val: self.progress.config(value=v))
+                self.log(f"✅ File {idx}/{total} done: {len(words)} words extracted.")
+            
+            self.log("✅ All transcriptions complete.")
+            self.root.after(0, lambda: self.progress.config(value=50))
+            if self.transcriptions and self.video_files:
+                self.root.after(0, lambda: self.load_video(self.current_video_index))
+                self.root.after(0, lambda: self.display_transcription(self.current_video_index))
+        except Exception as e:
+            self.log(f"❌ Error: {e}")
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.root.after(0, lambda: self.transcribe_btn.config(state='normal'))
+    
+    # ----------------------------------------------------------------
+    #  ارسال به Ollama
+    # ----------------------------------------------------------------
+    def send_to_ollama(self):
+        if not self.transcriptions or not self.video_files:
+            messagebox.showwarning("Warning", "No transcriptions found. Please transcribe first.")
+            return
+        
+        final_transcriptions = []
+        for idx, words in enumerate(self.transcriptions):
+            if self.corrected_texts and idx < len(self.corrected_texts) and self.corrected_texts[idx]:
+                final_transcriptions.append({
+                    "file": Path(self.video_files[idx]).name,
+                    "full_path": self.video_files[idx],
+                    "words": words,
+                    "corrected_text": self.corrected_texts[idx]
+                })
+            else:
+                final_transcriptions.append({
+                    "file": Path(self.video_files[idx]).name,
+                    "full_path": self.video_files[idx],
                     "words": words
                 })
-                self.progress['value'] = (idx / total) * 30
-                self.root.update_idletasks()
-            self.log("✅ تبدیل به متن با موفقیت انجام شد.")
-            
-            # ===== مرحله ۲: Ollama =====
-            self.log("🧠 مرحله ۲: ارسال به هوش مصنوعی محلی (Ollama) و دریافت برنامه تدوین...")
-            edl_json = get_edl_from_ollama(
-                all_transcriptions,
+        
+        self.log("🧠 Sending to Ollama for editing decision...")
+        self.progress['value'] = 60
+        try:
+            self.edl_json = get_edl_from_ollama(
+                final_transcriptions,
                 model_name=self.ollama_model_var.get()
             )
-            self.log(f"✅ برنامه تدوین دریافت شد: {len(edl_json['clips'])} کلیپ انتخاب شده.")
-            self.progress['value'] = 70
-            self.root.update_idletasks()
-            
-            # ===== مرحله ۳: انتخاب مسیر خروجی =====
-            output_file = filedialog.asksaveasfilename(
-                defaultextension=".mp4",
-                filetypes=[("MP4 files", "*.mp4")],
-                title="ذخیره ویدئوی نهایی"
-            )
-            if not output_file:
-                self.log("❌ عملیات لغو شد (خروجی ذخیره نشد).")
-                self._finish()
-                return
-            
-            # ===== مرحله ۴: اجرای FFmpeg =====
-            self.log("✂️ مرحله ۳: اجرای تدوین با FFmpeg...")
-            # نیاز به تصحیح مسیر فایل‌های مبدأ در EDL (چون LLM فقط نام فایل را می‌دهد، باید مسیر کامل را بیابیم)
+            self.log(f"✅ EDL received: {len(self.edl_json['clips'])} clips selected.")
+            self.progress['value'] = 80
+            messagebox.showinfo("Success", f"Ollama selected {len(self.edl_json['clips'])} clips.")
+        except Exception as e:
+            self.log(f"❌ Error from Ollama: {e}")
+            messagebox.showerror("Error", str(e))
+    
+    # ----------------------------------------------------------------
+    #  ساخت ویدئوی نهایی
+    # ----------------------------------------------------------------
+    def export_final(self):
+        if not self.edl_json or not self.edl_json.get('clips'):
+            messagebox.showwarning("Warning", "No EDL data. Run 'Send to Ollama & Edit' first.")
+            return
+        
+        output_file = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            filetypes=[("MP4 files", "*.mp4")],
+            title="Save Final Video"
+        )
+        if not output_file:
+            self.log("❌ Export cancelled.")
+            return
+        
+        self.log("✂️ Running FFmpeg to create final video...")
+        self.progress['value'] = 80
+        try:
             file_map = {Path(f).name: f for f in self.video_files}
-            for clip in edl_json['clips']:
+            for clip in self.edl_json['clips']:
                 if clip['source_file'] not in file_map:
-                    raise ValueError(f"فایل {clip['source_file']} در ورودی یافت نشد.")
+                    raise ValueError(f"File '{clip['source_file']}' not found in input.")
                 clip['source_file'] = file_map[clip['source_file']]
             
-            perform_editing(edl_json, output_file)
-            self.log(f"✅ ویدئوی نهایی با موفقیت ساخته شد: {output_file}")
+            perform_editing(self.edl_json, output_file)
+            self.log(f"✅ Final video created: {output_file}")
             self.progress['value'] = 100
-            messagebox.showinfo("پایان", "تدوین با موفقیت انجام شد!")
+            messagebox.showinfo("Success", f"Video saved to:\n{output_file}")
         except Exception as e:
-            self.log(f"❌ خطا: {str(e)}")
-            messagebox.showerror("خطا", str(e))
-        finally:
-            self._finish()
-    
-    def _finish(self):
-        self.start_btn.config(state='normal')
-        self.progress['value'] = 0
+            self.log(f"❌ FFmpeg error: {e}")
+            messagebox.showerror("Error", str(e))
 
-# =============== اجرای برنامه ===============
+
+# ================================================================
+#  اجرا
+# ================================================================
+
 if __name__ == "__main__":
     root = tk.Tk()
-    app = EditingApp(root)
+    app = VideoEditorApp(root)
     root.mainloop()
